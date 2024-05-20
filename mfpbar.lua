@@ -20,10 +20,10 @@ local utils = require('mp.utils')
 local mpopt = require('mp.options')
 
 -- poor man's enum
-
-local pbar_hidden      = 0
-local pbar_minimized   = 1
-local pbar_active      = 2
+local pbar_uninit      = 0
+local pbar_hidden      = 1
+local pbar_minimized   = 2
+local pbar_active      = 3
 
 -- globals
 
@@ -31,8 +31,9 @@ local state = {
 	osd = nil,
 	dpy_w = 0,
 	dpy_h = 0,
-	pbar = pbar_hidden,
+	pbar = pbar_uninit,
 	mouse = nil,
+	mouse_prev = nil,
 	cached_ranges = nil,
 	duration = nil,
 	chapters = nil,
@@ -46,6 +47,7 @@ local state = {
 		disabled = true,
 		available = false
 	},
+	userdata_avail = false,
 }
 
 local opt = {
@@ -66,20 +68,25 @@ local opt = {
 	-- TODO: add a configurable vpad as well ?
 	font_border_width = 2,
 	font_border_color = "000000",
-	proximity = 40,
+	proximity = "40",
 	preview_border_width = 2,
 	preview_border_color = "BDAE93",
 	chapter_marker_size = 3,
 	chapter_marker_color = "BDAE93",
 	chapter_marker_border_width = 1,
 	chapter_marker_border_color = "161616",
+	chapter_proximity = "0.64%",
 	minimize_timeout = 3,
+
+	debug = false,
 }
+
+local zassert = function() end
 
 -- function implementation
 
 -- ASS uses BBGGRR format, which fucking sucks
-function rgb_to_ass(color)
+local function rgb_to_ass(color)
 	if (not string.len(color) == 6) then
 		msg.error("Invalid color: " .. color)
 		return "FFFFFF"
@@ -90,21 +97,21 @@ function rgb_to_ass(color)
 	return string.upper(b .. g .. r)
 end
 
-function grab_chapter_name_at(sec)
-	assert(state.chapters)
+local function grab_chapter_name_at(sec)
+	zassert(state.chapters)
 	local name = nil
 	local psec = -1
 	for _, c in ipairs(state.chapters) do
 		if (sec > c.time) then
 			name = c.title
 		end
-		assert(psec < c.time)
+		zassert(psec <= c.time)
 		psec = c.time
 	end
 	return name
 end
 
-function format_time(t)
+local function format_time(t)
 	local h = math.floor(t / (60 * 60))
 	t = t - (h * 60 * 60)
 	local m = math.floor(t / 60)
@@ -112,27 +119,66 @@ function format_time(t)
 	return string.format("%.2d:%.2d:%.2d", h, m, s)
 end
 
-function round(n)
-	assert(n >= 0)
+local function round(n)
+	zassert(n >= 0)
 	return math.floor(n + 0.5)
 end
 
-function clamp(n, min, max)
+local function clamp(n, min, max)
 	return math.min(math.max(n, min), max)
 end
 
-function hover_to_sec(mx, dw, duration)
-	assert(duration)
+local function table_contains(t, value)
+	for k,v in ipairs(t) do
+		if (v == value) then
+			return true
+		end
+	end
+	return false
+end
+
+local function abs_pixels(p, whole)
+	if (p < 1) then
+		return whole * p
+	else
+		return p
+	end
+end
+
+local function parse_pixel_or_percent(s)
+	local n;
+	if (string.sub(s, -1) == "%") then
+		n = tonumber(string.sub(s, 1, -2)) / 100.0
+		if (n >= 1.0) then
+			n = math.huge
+		end
+	else
+		n = math.max(tonumber(s), 1)
+	end
+	return n
+end
+
+local function hover_to_sec(mx, dw, duration)
+	zassert(duration)
+	if (opt.chapter_proximity ~= 0 and state.chapters) then
+		local prox = abs_pixels(opt.chapter_proximity, state.dpy_w)
+		for _,c in ipairs(state.chapters) do
+			local x = state.dpy_w * (c.time / duration)
+			if (math.abs(x - state.mouse.x) <= prox) then
+				return c.time;
+			end
+		end
+	end
 	local n = duration * ((mx + 0.5) / dw)
 	return clamp(n, 0, duration)
 end
 
-function render()
+local function render()
 	state.osd:update()
 	state.osd.data = nil
 end
 
-function draw_append(text)
+local function draw_append(text)
 	if (state.osd.data == nil) then
 		state.osd.data = text
 	else
@@ -140,8 +186,8 @@ function draw_append(text)
 	end
 end
 
-function draw_rect_point(x0, y0, x1, y1, x2, y2, x3, y3, color, opt)
-	local s = '{\\pos(0, 0)}'
+local function draw_rect_point(x0, y0, x1, y1, x2, y2, x3, y3, color, opt)
+	local s = '{\\pos(0, 0)\\an7}'
 	opt = opt or {}
 	s = s .. '{\\1c&' .. color .. '&}'
 	s = s .. '{\\1a&' .. (opt.alpha or "00") .. '&}'
@@ -154,7 +200,7 @@ function draw_rect_point(x0, y0, x1, y1, x2, y2, x3, y3, color, opt)
 	draw_append(s)
 end
 
-function draw_rect(x, y, w, h, color, opt)
+local function draw_rect(x, y, w, h, color, opt)
 	draw_rect_point(
 		x,      y,
 		x + w,  y,
@@ -164,7 +210,7 @@ function draw_rect(x, y, w, h, color, opt)
 	)
 end
 
-function draw_text(x, y, size, text, opt)
+local function draw_text(x, y, size, text, opt)
 	local s = string.format('{\\pos(%d, %d)}{\\fs%d}', x, y, size)
 	opt = opt or {}
 	s = s .. '{\\bord' .. (opt.bw or '0') .. '}'
@@ -174,7 +220,7 @@ function draw_text(x, y, size, text, opt)
 end
 
 -- TODO: make this less janky.
-function pbar_draw()
+local function pbar_draw()
 	local dpy_w = state.dpy_w
 	local dpy_h = state.dpy_h
 	local ypos = 0
@@ -182,7 +228,7 @@ function pbar_draw()
 	local duration = state.duration
 	local clist = state.chapters
 
-	assert(state.pbar == pbar_minimized or state.pbar == pbar_active)
+	zassert(state.pbar == pbar_minimized or state.pbar == pbar_active)
 
 	if (play_pos == nil or dpy_w == 0 or dpy_h == 0) then
 		return
@@ -190,7 +236,7 @@ function pbar_draw()
 
 	-- L0: playback cursor
 	local pb_h = state.pbar == pbar_minimized and opt.pbar_minimized_height or opt.pbar_height
-	assert(pb_h > 0)
+	zassert(pb_h > 0)
 	pb_h = dpy_h * (pb_h / 100)
 	pb_h = math.max(round(pb_h), 4)
 	local pb_w = dpy_w * (play_pos/100.0)
@@ -202,7 +248,7 @@ function pbar_draw()
 	if (duration) then
 		-- L1: cache cusor
 		if (state.cached_ranges and opt.cachebar_height > 0) then
-			assert(#state.cached_ranges > 0)
+			zassert(#state.cached_ranges > 0)
 			local ch = dpy_h * (opt.cachebar_height / 100)
 			ch = math.max(round(ch), 2)
 			draw_rect(
@@ -223,18 +269,23 @@ function pbar_draw()
 
 		-- L0-???: chapters
 		if (clist and opt.chapter_marker_size > 0) then
-			assert(#clist > 0)
+			zassert(#clist > 0)
 			local bw = opt.chapter_marker_border_width
 			local tw = opt.chapter_marker_size
 			local miny = tw + bw + 1 -- +1 for pad
 			local y = dpy_h - math.max(pb_h / 2, miny)
 			for _, c in ipairs(clist) do
 				local x = dpy_w * (c.time / duration)
+				local scale = tw;
+				local prox = abs_pixels(opt.chapter_proximity, state.dpy_w)
+				if (state.pbar == pbar_active and math.abs(x - state.mouse.x) <= prox) then
+					scale = round(scale * 1.5);
+				end
 				draw_rect_point(
-					x - tw,  y,
-					x,       y - tw,
-					x + tw,  y,
-					x,       y + tw,
+					x - scale,  y,
+					x,          y - scale,
+					x + scale,  y,
+					x,          y + scale,
 					opt.chapter_marker_color,
 					{ bw = bw, bcolor = opt.chapter_marker_border_color }
 				)
@@ -249,16 +300,17 @@ function pbar_draw()
 		local fopt = { bw = opt.font_border_width, bcolor = opt.font_border_color }
 
 		-- L2: timeline
+		local timeline_vpad = 2
 		-- LHS: current playback position
 		local time = mp.get_property_osd("time-pos", "00:00:00")
-		draw_text(pad, dpy_h - (ypos + fs), fs, time, fopt)
+		draw_text(pad, dpy_h - (ypos + fs + timeline_vpad), fs, "{\\an7}" .. time, fopt)
 		-- RHS: time/playback remaining
 		local rem = "-" .. mp.get_property_osd(opt.timeline_rhs, "99:99:99")
-		draw_text(dpy_w - pad, dpy_h - (ypos + fs), fs, "{\\an9}" .. rem, fopt)
-		ypos = ypos + fs + (fopt.bw * 2)
+		draw_text(dpy_w - pad, dpy_h - (ypos + fs + timeline_vpad), fs, "{\\an9}" .. rem, fopt)
+		ypos = ypos + fs + (fopt.bw * 2) + timeline_vpad
 
 		if (duration) then
-			assert(state.mouse)
+			zassert(state.mouse)
 
 			-- L0-2: hovered timeline
 			local hover_sec = hover_to_sec(state.mouse.x, dpy_w, duration)
@@ -278,7 +330,7 @@ function pbar_draw()
 			-- L3: chapter name
 			local cname = clist and grab_chapter_name_at(hover_sec) or nil
 			if cname then
-				assert(cname)
+				zassert(cname)
 				local fw = string.len(cname) * fs * 0.28 -- guesstimate again
 				local x = clamp(state.mouse.x, pad + fw, dpy_w - (pad + fw))
 				draw_text(
@@ -319,18 +371,35 @@ function pbar_draw()
 	render()
 end
 
-function pbar_update(next_state)
+local function pbar_pressed()
+	zassert(state.mouse.hover)
+	zassert(state.pbar == pbar_active)
+	if (state.duration) then
+		mp.set_property("time-pos",  hover_to_sec(
+			state.mouse.x, state.dpy_w, state.duration
+		));
+	end
+end
+
+local function pbar_update(next_state)
 	local dpy_w = state.dpy_w
 	local dpy_h = state.dpy_h
 
-	if (dpy_w == 0 or dpy_h == 0 or state.pbar == next_state) then
+	if (dpy_w == 0 or dpy_h == 0 or
+	    state.pbar == next_state or state.pbar == pbar_uninit)
+	then
 		return
 	end
 
-	assert(dpy_w > 0)
-	assert(dpy_h > 0)
+	zassert(dpy_w > 0)
+	zassert(dpy_h > 0)
 
-	-- TODO: reduce latency when pbar is active
+	local statestr = {
+		[pbar_uninit] = "uninit", [pbar_active] = "active",
+		[pbar_minimized] = "minimized", [pbar_hidden] = "hidden"
+	}
+	msg.debug('[UPDATE]: ', statestr[state.pbar], '=> ', statestr[next_state]);
+
 	if (next_state == pbar_active) then
 		state.pbar = pbar_active
 		pbar_draw()
@@ -342,15 +411,9 @@ function pbar_update(next_state)
 			mp.observe_property("time-pos", nil, pbar_draw)
 			state.time_observed = true
 		end
-		if (state.timeout) then
-			assert(opt.minimize_timeout > 0)
-			state.timeout:kill()
-			state.timeout.timeout = opt.minimize_timeout
-			state.timeout:resume()
-		end
 	else
 		if (next_state == pbar_minimized) then
-			assert(opt.pbar_minimized_height > 0)
+			zassert(opt.pbar_minimized_height > 0)
 			state.pbar = pbar_minimized
 			pbar_draw()
 			if (not state.time_observed) then
@@ -358,16 +421,15 @@ function pbar_update(next_state)
 				state.time_observed = true
 			end
 		elseif (next_state == pbar_hidden) then
-			assert(state.pbar ~= pbar_hidden)
+			zassert(state.pbar ~= pbar_hidden)
 			state.pbar = pbar_hidden
-			-- clear everything
-			state.osd.data = ''
+			state.osd.data = '' -- clear everything
 			render()
-			assert(state.time_observed)
+			zassert(state.time_observed)
 			mp.unobserve_property(pbar_draw)
 			state.time_observed = false
 		else
-			assert(false, "unreachable")
+			zassert(false, "unreachable")
 		end
 
 		if (state.press_bounded) then
@@ -381,7 +443,8 @@ function pbar_update(next_state)
 	end
 end
 
-function pbar_minimize_or_hide()
+local function pbar_minimize_or_hide()
+	msg.debug("[MIN-HIDE]")
 	if (opt.pbar_minimized_height > 0 and not (opt.pbar_fullscreen_hide and state.fullscreen)) then
 		pbar_update(pbar_minimized)
 	else
@@ -389,19 +452,16 @@ function pbar_minimize_or_hide()
 	end
 end
 
-function pbar_pressed()
-	assert(state.mouse.hover)
-	assert(state.pbar == pbar_active)
-	if (state.duration) then
-		mp.set_property("time-pos",  hover_to_sec(
-			state.mouse.x, state.dpy_w, state.duration
-		));
-	end
+local function mouse_isactive(m)
+	local px = abs_pixels(opt.proximity, state.dpy_h)
+	return m.hover and math.abs(m.y - state.dpy_h) < px
 end
 
-function update_mouse_pos(kind, mouse)
-	assert(kind == "mouse-pos")
+local function update_mouse_pos(kind, mouse)
+	zassert(kind == "mouse-pos")
+	state.mouse_prev = state.mouse or { hover = false }
 	state.mouse = mouse
+	-- msg.debug('[MOUSE] hover = ', mouse.hover, ' x = ', mouse.x, ' y = ', mouse.y)
 
 	local dpy_w = state.dpy_w
 	local dpy_h = state.dpy_h
@@ -410,43 +470,54 @@ function update_mouse_pos(kind, mouse)
 		return
 	end
 
-	assert(dpy_w > 0)
-	assert(dpy_h > 0)
-	assert(mouse)
+	zassert(dpy_w > 0)
+	zassert(dpy_h > 0)
+	zassert(mouse)
 
 	-- TODO: ensure there's enough height to draw our stuff ?
-	if (mouse.hover and mouse.y > dpy_h - opt.proximity) then
+	if (mouse_isactive(state.mouse_prev) and mouse_isactive(mouse)) then
+		-- TODO: a better way to do this without killing/resuming a
+		-- timer on each mouse update?
+		state.timeout:kill()
+		state.timeout:resume()
 		pbar_update(pbar_active)
 	else
+		state.timeout:kill()
 		pbar_minimize_or_hide()
 	end
 end
 
-function update_fullscreen(kind, fs)
-	assert(kind == "fullscreen")
+local function update_fullscreen(kind, fs)
+	zassert(kind == "fullscreen")
 	state.fullscreen = fs
+	msg.debug('[FULLSCREEN] fs = ', fs)
 	pbar_minimize_or_hide()
 end
 
-function set_dpy_size(kind, osd)
-	assert(kind == "osd-dimensions")
+local function update_focus(kind, foc)
+	zassert(kind == "focused")
+	msg.debug('[FOCUS] focus = ', foc)
+	state.mouse_prev = { hover = false, x = 0, y = 0 }
+end
+
+local function set_dpy_size(kind, osd)
+	zassert(kind == "osd-dimensions")
 	state.dpy_w     = osd.w
 	state.osd.res_x = osd.w
 	state.dpy_h     = osd.h
 	state.osd.res_y = osd.h
-	-- HACK: ensure we don't obstruct the console (excluding the preview and hovered timeline)
-	-- the shared_script_property_* functions are documented as undocumented :)
-	-- and users are discouraged to use them, but whatever...
+	msg.debug('[DPY] w = ', osd.w, ' h = ', osd.h)
+
+	-- ensure we don't obstruct the console (excluding the preview and hovered timeline)
 	local b = (opt.font_size + (opt.font_border_width * 2) + 8) / state.dpy_h -- +8 padding
 	b = b + ((opt.pbar_minimized_height + opt.cachebar_height) / 100.0)
-	utils.shared_script_property_set(
-		'osc-margins',
-		string.format('%f,%f,%f,%f', 0, 0, 0, b)
-	)
+	if (state.userdata_avail) then
+		mp.set_property_native("user-data/osc/margins", { t = 0, b =  b})
+	end
 end
 
-function set_cache_state(kind, c)
-	assert(kind == "demuxer-cache-state")
+local function set_cache_state(kind, c)
+	zassert(kind == "demuxer-cache-state")
 	if (c == nil) then
 		state.cached_ranges = nil
 	else
@@ -459,21 +530,22 @@ function set_cache_state(kind, c)
 	end
 end
 
-function set_duration(kind, d)
-	assert(kind == "duration")
+local function set_duration(kind, d)
+	zassert(kind == "duration")
 	state.duration = d
 end
 
-function set_chapter_list(kind, c)
-	assert(kind == "chapter-list")
+local function set_chapter_list(kind, c)
+	zassert(kind == "chapter-list")
 	if (c and #c > 0) then
 		state.chapters = c
+		table.sort(state.chapters, function(a, b) return a.time < b.time end)
 	else
 		state.chapters = nil
 	end
 end
 
-function set_thumbfast(json)
+local function set_thumbfast(json)
 	local data = utils.parse_json(json)
 	if (type(data) ~= "table" or not data.width or not data.height) then
 		msg.error("thumbfast-info: received json didn't produce a table with thumbnail information")
@@ -482,21 +554,42 @@ function set_thumbfast(json)
 	end
 end
 
-function start_minimized(kind, thing)
-	assert(kind == 'current-window-scale')
-	if thing and state.pbar == pbar_hidden then
-		pbar_update(pbar_minimized)
-		mp.unobserve_property(start_minimized)
+local function pbar_init(kind, thing)
+	zassert(kind == 'vo-configured')
+	msg.debug("[VO-CONFIGURED]", thing, state.pbar)
+
+	if thing then
+		zassert(state.pbar == pbar_uninit)
+		state.pbar = pbar_hidden
+		if (opt.pbar_minimized_height > 0) then
+			pbar_update(pbar_minimized)
+		end
+		mp.unobserve_property(pbar_init)
 	end
 end
 
-function init()
+local function init()
 	mpopt.read_options(opt, "mfpbar")
 	for k,v in pairs(opt) do
 		if string.find(k, "_color$") then
 			opt[k] = rgb_to_ass(v)
 		end
 	end
+
+	if opt.debug then
+		msg.debug("[ASSERTIONS] enabled")
+		zassert = assert
+	else
+		zassert(false)
+	end
+
+	opt.proximity         = parse_pixel_or_percent(opt.proximity);
+	opt.chapter_proximity = parse_pixel_or_percent(opt.chapter_proximity);
+
+	state.userdata_avail = table_contains(
+		mp.get_property_native("property-list"), "user-data"
+	)
+	msg.debug('[INIT] user-data: ' .. tostring(state.userdata_avail))
 
 	state.osd = mp.create_osd_overlay("ass-events")
 	mp.observe_property("osd-dimensions", "native", set_dpy_size)
@@ -505,18 +598,21 @@ function init()
 	mp.observe_property('chapter-list', 'native', set_chapter_list)
 	mp.register_script_message("thumbfast-info", set_thumbfast)
 	mp.observe_property('fullscreen', 'native', update_fullscreen)
+	mp.observe_property('focused', 'native', update_focus)
 
 	-- NOTE: mouse-pos doesn't work mpv versions older than v33
 	mp.observe_property("mouse-pos", "native", update_mouse_pos)
+
 	if (opt.minimize_timeout > 0) then
 		state.timeout = mp.add_timeout(opt.minimize_timeout, pbar_minimize_or_hide)
+		state.timeout:kill() -- update_mouse_pos() will kill/resume this as needed
+	else
+		state.timeout = { kill = function() end, resume = function() end }
 	end
-	if (opt.pbar_minimized_height > 0) then
-		-- HACK: mpv doesn't open the window instantly by default.
-		-- so wait for 'current-window-scale' as a hacky hook for when
-		-- the window opens.
-		mp.observe_property('current-window-scale', 'native', start_minimized)
-	end
+
+	-- HACK: mpv doesn't open the window instantly by default.
+	-- so wait for 'vo-configured' as a hook for when the window opens.
+	mp.observe_property('vo-configured', 'native', pbar_init)
 end
 
 init()
