@@ -1,16 +1,16 @@
 --[[
 	This file is part of mfpbar.
-	
+
 	mfpbar is free software: you can redistribute it and/or modify it
 	under the terms of the GNU Affero General Public License as published by the
 	Free Software Foundation, either version 3 of the License, or (at your
 	option) any later version.
-	
+
 	mfpbar is distributed in the hope that it will be useful, but WITHOUT
 	ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 	FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
 	for more details.
-	
+
 	You should have received a copy of the GNU Affero General Public License
 	along with mfpbar. If not, see <https://www.gnu.org/licenses/>.
 ]]
@@ -20,10 +20,11 @@ local utils = require('mp.utils')
 local mpopt = require('mp.options')
 
 -- poor man's enum
-local pbar_uninit      = 0
-local pbar_hidden      = 1
-local pbar_minimized   = 2
-local pbar_active      = 3
+local PBAR_UNINIT      = 0
+local PBAR_HIDDEN      = 1
+local PBAR_MINIMIZED   = 2
+local PBAR_MAXIMIZED   = 3
+local PBAR_ACTIVE      = 4
 
 -- globals
 
@@ -31,13 +32,14 @@ local state = {
 	osd = nil,
 	dpy_w = 0,
 	dpy_h = 0,
-	pbar = pbar_uninit,
+	pbar = PBAR_UNINIT,
 	mouse = nil,
 	mouse_prev = nil,
 	cached_ranges = nil,
 	duration = nil,
 	chapters = nil,
-	timeout = nil,
+	minimize_timeout = { kill = function() end, resume = function() end },
+	maximize_timeout = { kill = function() end, resume = function() end },
 	time_observed = false,
 	press_bounded = false,
 	fullscreen = false,
@@ -54,15 +56,15 @@ local opt = {
 	pbar_height = 2,
 	pbar_minimized_height = 0.5,
 	pbar_color = "CCCCCC",
-	pbar_bg_alpha = "3F",
+	pbar_bg_color = "000000C0",
 	pbar_fullscreen_hide = true,
 	cachebar_height = 0.24,
 	cachebar_color = "1C6C89",
-	cachebar_uncached_color = "CC3A2A",
-	cachebar_uncached_alpha = "70",
+	cachebar_uncached_color = "CC3A2A8F",
 	-- TODO: allow selecting "duration" as well ?
 	timeline_rhs = "time-remaining",
 	hover_bar_color = "BDAE93",
+	font_color = "EBEBEB",
 	font_size = 16,
 	font_pad = 4, -- TODO: rename this to hpad ?
 	-- TODO: add a configurable vpad as well ?
@@ -77,24 +79,50 @@ local opt = {
 	chapter_marker_border_color = "161616",
 	chapter_proximity = "0.64%",
 	minimize_timeout = 3,
+	maximize_timeout = 1.5,
+	maximize_on_seek = true,
 
 	debug = false,
+
+	-- backwards compat
+	pbar_bg_alpha = "",
+	cachebar_uncached_alpha = "",
 }
 
 local zassert = function() end
 
 -- function implementation
 
--- ASS uses BBGGRR format, which fucking sucks
-local function rgb_to_ass(color)
-	if (not string.len(color) == 6) then
-		msg.error("Invalid color: " .. color)
-		return "FFFFFF"
+-- ASS uses BBGGRR format, which fucking sucks.
+-- so we accept css style hex colors in config and convert it into BBGGRROO,
+-- where 'O' stands for opacity.
+local function hex_to_ass(color)
+	local og_color = color
+	local r, g, b, a
+
+	if (string.len(color) == 3) then
+		color = color .. 'F'
+	elseif (string.len(color) == 6) then
+		color = color .. 'FF'
 	end
-	local r = string.sub(color, 1, 2)
-	local g = string.sub(color, 3, 4)
-	local b = string.sub(color, 5, 6)
-	return string.upper(b .. g .. r)
+
+	if (string.len(color) == 4) then
+		r = string.rep(string.sub(color, 1, 1), 2)
+		g = string.rep(string.sub(color, 2, 2), 2)
+		b = string.rep(string.sub(color, 3, 3), 2)
+		a = string.rep(string.sub(color, 4, 4), 2)
+	elseif (string.len(color) == 8) then
+		r = string.sub(color, 1, 2)
+		g = string.sub(color, 3, 4)
+		b = string.sub(color, 5, 6)
+		a = string.sub(color, 7, 8)
+	else
+		msg.error("Invalid color: " .. og_color)
+		return "FFFFFF00"
+	end
+
+	local o = string.format("%02X", 0xFF - tonumber("0x" .. a))
+	return string.upper(b .. g .. r .. o)
 end
 
 local function grab_chapter_name_at(sec)
@@ -102,7 +130,7 @@ local function grab_chapter_name_at(sec)
 	local name = nil
 	local psec = -1
 	for _, c in ipairs(state.chapters) do
-		if (sec > c.time) then
+		if (sec >= c.time) then
 			name = c.title
 		end
 		zassert(psec <= c.time)
@@ -186,13 +214,21 @@ local function draw_append(text)
 	end
 end
 
+local function draw_color(color, section)
+	zassert(color:len() == 8)
+	local bgr = string.sub(color, 1, 6)
+	local opacity = string.sub(color, 7, 8)
+	local ret  = '{\\' .. section .. 'c&' .. bgr     .. '&}'
+	ret = ret .. '{\\' .. section .. 'a&' .. opacity .. '&}'
+	return ret
+end
+
 local function draw_rect_point(x0, y0, x1, y1, x2, y2, x3, y3, color, opt)
 	local s = '{\\pos(0, 0)\\an7}'
 	opt = opt or {}
-	s = s .. '{\\1c&' .. color .. '&}'
-	s = s .. '{\\1a&' .. (opt.alpha or "00") .. '&}'
+	s = s .. draw_color(color, "1");
+	s = s .. draw_color(opt.bcolor or "00000000", "3");
 	s = s .. '{\\bord' .. (opt.bw or '0') .. '}'
-	s = s .. '{\\3c&' .. (opt.bcolor or "000000") .. '&}'
 	s = s .. string.format(
 		'{\\p1}m %d %d l %d %d %d %d %d %d{\\p0}',
 		x0, y0, x1, y1, x2, y2, x3, y3
@@ -213,8 +249,9 @@ end
 local function draw_text(x, y, size, text, opt)
 	local s = string.format('{\\pos(%d, %d)}{\\fs%d}', x, y, size)
 	opt = opt or {}
+	s = s .. draw_color(opt.color  or "EBEBEB00", "1");
+	s = s .. draw_color(opt.bcolor or "00000000", "3");
 	s = s .. '{\\bord' .. (opt.bw or '0') .. '}'
-	s = s .. '{\\3c&' .. (opt.bcolor or "000000") .. '&}'
 	s = s .. text
 	draw_append(s)
 end
@@ -228,21 +265,21 @@ local function pbar_draw()
 	local duration = state.duration
 	local clist = state.chapters
 
-	zassert(state.pbar == pbar_minimized or state.pbar == pbar_active)
+	zassert(state.pbar >= PBAR_MINIMIZED and state.pbar <= PBAR_ACTIVE)
 
 	if (play_pos == nil or dpy_w == 0 or dpy_h == 0) then
 		return
 	end
 
 	-- L0: playback cursor
-	local pb_h = state.pbar == pbar_minimized and opt.pbar_minimized_height or opt.pbar_height
+	local pb_h = state.pbar == PBAR_MINIMIZED and opt.pbar_minimized_height or opt.pbar_height
 	zassert(pb_h > 0)
 	pb_h = dpy_h * (pb_h / 100)
 	pb_h = math.max(round(pb_h), 4)
 	local pb_w = dpy_w * (play_pos/100.0)
 	local pb_y = dpy_h - (pb_h + ypos)
 	draw_rect(0,    pb_y, pb_w, pb_h, opt.pbar_color)
-	draw_rect(pb_w, pb_y, dpy_w - pb_w, pb_h, "000000", { alpha = opt.pbar_bg_alpha })
+	draw_rect(pb_w, pb_y, dpy_w - pb_w, pb_h, opt.pbar_bg_color)
 	ypos = ypos + pb_h
 
 	if (duration) then
@@ -253,8 +290,7 @@ local function pbar_draw()
 			ch = math.max(round(ch), 2)
 			draw_rect(
 				0, dpy_h - (ch + ypos), dpy_w, ch,
-				opt.cachebar_uncached_color,
-				{ alpha = opt.cachebar_uncached_alpha }
+				opt.cachebar_uncached_color
 			)
 			for _, range in ipairs(state.cached_ranges) do
 				local s = range['start']
@@ -278,7 +314,7 @@ local function pbar_draw()
 				local x = dpy_w * (c.time / duration)
 				local scale = tw;
 				local prox = abs_pixels(opt.chapter_proximity, state.dpy_w)
-				if (state.pbar == pbar_active and math.abs(x - state.mouse.x) <= prox) then
+				if (state.pbar == PBAR_ACTIVE and math.abs(x - state.mouse.x) <= prox) then
 					scale = round(scale * 1.5);
 				end
 				draw_rect_point(
@@ -294,11 +330,10 @@ local function pbar_draw()
 		end
 	end
 
-	if (state.pbar == pbar_active) then
-		local fs = opt.font_size
-		local pad = opt.font_pad
-		local fopt = { bw = opt.font_border_width, bcolor = opt.font_border_color }
-
+	local fs = opt.font_size
+	local pad = opt.font_pad
+	local fopt = { color = opt.font_color, bw = opt.font_border_width, bcolor = opt.font_border_color }
+	if (state.pbar == PBAR_MAXIMIZED or state.pbar == PBAR_ACTIVE) then
 		-- L2: timeline
 		local timeline_vpad = 2
 		-- LHS: current playback position
@@ -308,62 +343,61 @@ local function pbar_draw()
 		local rem = "-" .. mp.get_property_osd(opt.timeline_rhs, "99:99:99")
 		draw_text(dpy_w - pad, dpy_h - (ypos + fs + timeline_vpad), fs, "{\\an9}" .. rem, fopt)
 		ypos = ypos + fs + (fopt.bw * 2) + timeline_vpad
+	end
 
-		if (duration) then
-			zassert(state.mouse)
+	if (state.pbar == PBAR_ACTIVE and duration) then
+		zassert(state.mouse)
+		-- L0-2: hovered timeline
+		local hover_sec = hover_to_sec(state.mouse.x, dpy_w, duration)
+		local hover_text = format_time(hover_sec)
+		draw_rect(
+			math.max(state.mouse.x - 1, 0), dpy_h - ypos,
+			2, ypos, opt.hover_bar_color
+		)
+		local fw = fs * 2 -- guesstimate ¯\_(ツ)_/¯
+		local x = clamp(state.mouse.x, pad + fw, dpy_w - (pad + fw))
+		draw_text(
+			x, dpy_h - (ypos + fs), fs,
+			"{\\an8}" .. hover_text, fopt
+		)
+		ypos = ypos + fs + (fopt.bw * 2)
 
-			-- L0-2: hovered timeline
-			local hover_sec = hover_to_sec(state.mouse.x, dpy_w, duration)
-			local hover_text = format_time(hover_sec)
-			draw_rect(
-				math.max(state.mouse.x - 1, 0), dpy_h - ypos,
-				2, ypos, opt.hover_bar_color
-			)
-			local fw = fs * 2 -- guesstimate ¯\_(ツ)_/¯
+		-- L3: chapter name
+		local cname = clist and grab_chapter_name_at(hover_sec) or nil
+		if cname then
+			zassert(cname)
+			local fw = string.len(cname) * fs * 0.28 -- guesstimate again
 			local x = clamp(state.mouse.x, pad + fw, dpy_w - (pad + fw))
 			draw_text(
-				x, dpy_h - (ypos + fs), fs,
-				"{\\an8}" .. hover_text, fopt
+				x, dpy_h - (ypos + fs),
+				fs, "{\\an8}" .. cname, fopt
 			)
 			ypos = ypos + fs + (fopt.bw * 2)
+		end
 
-			-- L3: chapter name
-			local cname = clist and grab_chapter_name_at(hover_sec) or nil
-			if cname then
-				zassert(cname)
-				local fw = string.len(cname) * fs * 0.28 -- guesstimate again
-				local x = clamp(state.mouse.x, pad + fw, dpy_w - (pad + fw))
-				draw_text(
-					x, dpy_h - (ypos + fs),
-					fs, "{\\an8}" .. cname, fopt
+		-- L4: preview thumbnail
+		if not state.thumbfast.disabled then
+			local pw = opt.preview_border_width
+			local hpad = 4 + pw
+			local tw = state.thumbfast.width
+			local th = state.thumbfast.height
+			local y = dpy_h - (ypos + th + pw)
+			local x = state.mouse.x - (tw / 2)
+			x = clamp(x, hpad, dpy_w - (hpad + tw))
+			mp.commandv(
+				"script-message-to", "thumbfast", "thumb",
+				hover_sec, x, y
+			)
+			ypos = ypos + th + pw
+
+			-- L4: preview border
+			if pw > 0 then
+				local c = opt.preview_border_color
+				draw_rect(
+					x, y, tw, th, "1616167F",
+					{ bw = pw, bcolor = c }
 				)
-				ypos = ypos + fs + (fopt.bw * 2)
-			end
-
-			-- L4: preview thumbnail
-			if not state.thumbfast.disabled then
-				local pw = opt.preview_border_width
-				local hpad = 4 + pw
-				local tw = state.thumbfast.width
-				local th = state.thumbfast.height
-				local y = dpy_h - (ypos + th + pw)
-				local x = state.mouse.x - (tw / 2)
-				x = clamp(x, hpad, dpy_w - (hpad + tw))
-				mp.commandv(
-					"script-message-to", "thumbfast", "thumb",
-					hover_sec, x, y
-				)
-				ypos = ypos + th + pw
-
-				-- L4: preview border
-				if pw > 0 then
-					local c = opt.preview_border_color
-					draw_rect(
-						x, y, tw, th, "161616",
-						{ alpha = "7F", bw = pw, bcolor = c }
-					)
-					ypos = ypos + pw
-				end
+				ypos = ypos + pw
 			end
 		end
 	end
@@ -373,7 +407,7 @@ end
 
 local function pbar_pressed()
 	zassert(state.mouse.hover)
-	zassert(state.pbar == pbar_active)
+	zassert(state.pbar == PBAR_ACTIVE)
 	if (state.duration) then
 		mp.set_property("time-pos",  hover_to_sec(
 			state.mouse.x, state.dpy_w, state.duration
@@ -386,7 +420,7 @@ local function pbar_update(next_state)
 	local dpy_h = state.dpy_h
 
 	if (dpy_w == 0 or dpy_h == 0 or
-	    state.pbar == next_state or state.pbar == pbar_uninit)
+	    state.pbar == next_state or state.pbar == PBAR_UNINIT)
 	then
 		return
 	end
@@ -395,13 +429,14 @@ local function pbar_update(next_state)
 	zassert(dpy_h > 0)
 
 	local statestr = {
-		[pbar_uninit] = "uninit", [pbar_active] = "active",
-		[pbar_minimized] = "minimized", [pbar_hidden] = "hidden"
+		[PBAR_UNINIT] = "uninit", [PBAR_HIDDEN] = "hidden",
+		[PBAR_MINIMIZED] = "minimized", [PBAR_MAXIMIZED] = "maximized",
+		[PBAR_ACTIVE] = "active",
 	}
 	msg.debug('[UPDATE]: ', statestr[state.pbar], '=> ', statestr[next_state]);
 
-	if (next_state == pbar_active) then
-		state.pbar = pbar_active
+	if (next_state == PBAR_ACTIVE) then
+		state.pbar = PBAR_ACTIVE
 		pbar_draw()
 		if (not state.press_bounded) then
 			mp.add_forced_key_binding('mbtn_left', 'pbar_pressed', pbar_pressed)
@@ -412,17 +447,24 @@ local function pbar_update(next_state)
 			state.time_observed = true
 		end
 	else
-		if (next_state == pbar_minimized) then
-			zassert(opt.pbar_minimized_height > 0)
-			state.pbar = pbar_minimized
+		if (next_state == PBAR_MAXIMIZED) then
+			state.pbar = PBAR_MAXIMIZED
 			pbar_draw()
 			if (not state.time_observed) then
 				mp.observe_property("time-pos", nil, pbar_draw)
 				state.time_observed = true
 			end
-		elseif (next_state == pbar_hidden) then
-			zassert(state.pbar ~= pbar_hidden)
-			state.pbar = pbar_hidden
+		elseif (next_state == PBAR_MINIMIZED) then
+			zassert(opt.pbar_minimized_height > 0)
+			state.pbar = PBAR_MINIMIZED
+			pbar_draw()
+			if (not state.time_observed) then
+				mp.observe_property("time-pos", nil, pbar_draw)
+				state.time_observed = true
+			end
+		elseif (next_state == PBAR_HIDDEN) then
+			zassert(state.pbar ~= PBAR_HIDDEN)
+			state.pbar = PBAR_HIDDEN
 			state.osd.data = '' -- clear everything
 			render()
 			zassert(state.time_observed)
@@ -446,10 +488,22 @@ end
 local function pbar_minimize_or_hide()
 	msg.debug("[MIN-HIDE]")
 	if (opt.pbar_minimized_height > 0 and not (opt.pbar_fullscreen_hide and state.fullscreen)) then
-		pbar_update(pbar_minimized)
+		pbar_update(PBAR_MINIMIZED)
 	else
-		pbar_update(pbar_hidden)
+		pbar_update(PBAR_HIDDEN)
 	end
+end
+
+local function pbar_maximize(time)
+	if (time) then
+		time = tonumber(time)
+	end
+	time = time or opt.maximize_timeout
+	msg.debug('[MAXIMIZE] recieved maximize request')
+	if (state.pbar == PBAR_ACTIVE or time <= 0) then return end
+	state.maximize_timeout:kill()
+	state.maximize_timeout = mp.add_timeout(time, pbar_minimize_or_hide)
+	pbar_update(PBAR_MAXIMIZED)
 end
 
 local function mouse_isactive(m)
@@ -478,11 +532,12 @@ local function update_mouse_pos(kind, mouse)
 	if (mouse_isactive(state.mouse_prev) and mouse_isactive(mouse)) then
 		-- TODO: a better way to do this without killing/resuming a
 		-- timer on each mouse update?
-		state.timeout:kill()
-		state.timeout:resume()
-		pbar_update(pbar_active)
-	else
-		state.timeout:kill()
+		state.minimize_timeout:kill()
+		state.minimize_timeout:resume()
+		state.maximize_timeout:kill()
+		pbar_update(PBAR_ACTIVE)
+	elseif (state.pbar ~= PBAR_MAXIMIZED) then
+		state.minimize_timeout:kill()
 		pbar_minimize_or_hide()
 	end
 end
@@ -512,7 +567,11 @@ local function set_dpy_size(kind, osd)
 	local b = (opt.font_size + (opt.font_border_width * 2) + 8) / state.dpy_h -- +8 padding
 	b = b + ((opt.pbar_minimized_height + opt.cachebar_height) / 100.0)
 	if (state.userdata_avail) then
-		mp.set_property_native("user-data/osc/margins", { t = 0, b =  b})
+		mp.set_property_native("user-data/osc/margins", { l = 0, r = 0, t = 0, b = b })
+	elseif (utils.shared_script_property_set ~= nil) then   -- for older mpv versions
+		utils.shared_script_property_set(
+			'osc-margins', string.format('%f,%f,%f,%f', 0, 0, 0, b)
+		)
 	end
 end
 
@@ -559,10 +618,10 @@ local function pbar_init(kind, thing)
 	msg.debug("[VO-CONFIGURED]", thing, state.pbar)
 
 	if thing then
-		zassert(state.pbar == pbar_uninit)
-		state.pbar = pbar_hidden
+		zassert(state.pbar == PBAR_UNINIT)
+		state.pbar = PBAR_HIDDEN
 		if (opt.pbar_minimized_height > 0) then
-			pbar_update(pbar_minimized)
+			pbar_update(PBAR_MINIMIZED)
 		end
 		mp.unobserve_property(pbar_init)
 	end
@@ -570,17 +629,34 @@ end
 
 local function init()
 	mpopt.read_options(opt, "mfpbar")
-	for k,v in pairs(opt) do
-		if string.find(k, "_color$") then
-			opt[k] = rgb_to_ass(v)
-		end
-	end
 
 	if opt.debug then
 		msg.debug("[ASSERTIONS] enabled")
 		zassert = assert
 	else
 		zassert(false)
+	end
+
+	for k,v in pairs(opt) do
+		if string.find(k, "_color$") then
+			opt[k] = hex_to_ass(v)
+			msg.debug(k .. "(" .. v .. ") => ", opt[k])
+		end
+	end
+
+	-- backwards compat
+	for _,a in ipairs({ "pbar_bg_alpha", "cachebar_uncached_alpha" }) do
+		if (opt[a]:len() == 2) then
+			local c = a:gsub("_alpha$", "_color")
+			msg.warn(a, "is deprecated, use", c, "instead")
+			opt[c] = string.sub(opt[c], 1, 6) .. opt[a]
+			opt[a] = nil
+		end
+	end
+
+	if (mp.get_property_native("osc") == true) then
+		msg.error("mfpbar will NOT function properly when default `osc` is also enabled");
+		msg.error("disable the default osc by putting `osc=no` in your `mpv.conf` file");
 	end
 
 	opt.proximity         = parse_pixel_or_percent(opt.proximity);
@@ -603,11 +679,14 @@ local function init()
 	-- NOTE: mouse-pos doesn't work mpv versions older than v33
 	mp.observe_property("mouse-pos", "native", update_mouse_pos)
 
+	mp.add_key_binding(nil, "maximize", pbar_maximize, { repeatable = true })
+	if (opt.maximize_on_seek) then
+		mp.register_event("seek", pbar_maximize)
+	end
+
 	if (opt.minimize_timeout > 0) then
-		state.timeout = mp.add_timeout(opt.minimize_timeout, pbar_minimize_or_hide)
-		state.timeout:kill() -- update_mouse_pos() will kill/resume this as needed
-	else
-		state.timeout = { kill = function() end, resume = function() end }
+		state.minimize_timeout = mp.add_timeout(opt.minimize_timeout, pbar_minimize_or_hide)
+		state.minimize_timeout:kill() -- update_mouse_pos() will kill/resume this as needed
 	end
 
 	-- HACK: mpv doesn't open the window instantly by default.
